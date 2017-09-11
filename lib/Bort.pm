@@ -134,86 +134,61 @@ package Bort::Watch {
 
 use Try::Tiny;
 
-my (@channel_watches, @direct_watches, @command_watches);
+my $watches = { };
 
-sub run_channel_watches {
-  my (undef, $ctx, $text) = @_;
-  my $matches = 0;
-  for my $watch (@channel_watches) {
-    next unless
-      (ref $watch->[0] eq 'Regexp' && $text =~ m/$watch->[0]/) ||
-      (ref $watch->[0] eq 'CODE' && $watch->[0]->($text));
-    try {
-      $watch->[1]->($ctx, $text);
+sub make_watch_methods {
+  my $type = shift;
+
+  my $add_method = sub {
+    my (undef, $match, $callback) = @_;
+    my ($plugin) = caller =~ m{::([^:]+)$};
+    $plugin //= caller;
+    push @{$watches->{$type}}, [ $match, $callback, $plugin ];
+  };
+
+  my $run_method = sub {
+    my (undef, $ctx, $text) = @_;
+    my $matches = 0;
+    my ($command, @args);
+
+    if ($type eq 'command') {
+      $text =~ s{^\s*(.*)\s*$}{$1};
+      $text =~ s{\s+}{ }g;
+      ($command, @args) = split ' ', $text;
     }
-    catch {
-      $log->("$watch->[2]: channel watch handler died: $_");
-      $ctx->reply(":face_with_head_bandage: channel watch handler died, check the log");
-    };
-    $matches++;
-  }
-  return $matches;
-}
 
-sub run_direct_watches {
-  my (undef, $ctx, $text) = @_;
-  my $matches = 0;
-  for my $watch (@direct_watches) {
-    next unless
-      (ref $watch->[0] eq 'Regexp' && $text =~ m/$watch->[0]/i) ||
-      (ref $watch->[0] eq 'CODE' && $watch->[0]->($text));
-    try {
-      $watch->[1]->($ctx, $text);
+    for my $watch (@{$watches->{$type}}) {
+      if ($type eq 'command') {
+        next unless lc $watch->[0] eq lc $command;
+      }
+      else {
+        next unless
+          (ref $watch->[0] eq 'Regexp' && $text =~ m/$watch->[0]/) ||
+          (ref $watch->[0] eq 'CODE' && $watch->[0]->($text));
+      }
+      try {
+        $watch->[1]->($ctx, $type eq 'command' ? @args : $text);
+      }
+      catch {
+        $log->("$watch->[2]: $type watch handler died: $_");
+        $ctx->reply(":face_with_head_bandage: $type watch handler died, check the log");
+      };
+      $matches++;
     }
-    catch {
-      $log->("$watch->[2]: direct watch handler died: $_");
-      $ctx->reply(":face_with_head_bandage: direct watch handler died, check the log");
-    };
-    $matches++;
+    return $matches;
+  };
+
+  return $add_method, $run_method;
+}
+
+BEGIN {
+  for my $type (qw( channel direct command )) {
+    my ($add_method, $run_method) = make_watch_methods( $type );
+
+    no strict 'refs';
+    *{ "add_${type}_watch"   } = $add_method;
+    *{ "run_${type}_watches" } = $run_method;
   }
-  return $matches;
-}
-
-sub run_command_watches {
-  my (undef, $ctx, $text) = @_;
-  $text =~ s{^\s*(.*)\s*$}{$1};
-  $text =~ s{\s+}{ }g;
-  my ($command, @args) = split ' ', $text;
-
-  my $matches = 0;
-  for my $watch (@command_watches) {
-    next unless lc $watch->[0] eq lc $command;
-    try {
-      $watch->[1]->($ctx, @args);
-    }
-    catch {
-      $log->("$watch->[2]: command watch handler died: $_");
-      $ctx->reply(":face_with_head_bandage: command watch handler died, check the log");
-    };
-    $matches++;
-  }
-  return $matches;
-}
-
-sub add_channel_watch {
-  my (undef, $match, $callback) = @_;
-  my ($plugin) = caller =~ m{::([^:]+)$};
-  $plugin //= caller;
-  push @channel_watches, [ $match, $callback, $plugin ];
-}
-
-sub add_direct_watch {
-  my (undef, $match, $callback) = @_;
-  my ($plugin) = caller =~ m{::([^:]+)$};
-  $plugin //= caller;
-  push @direct_watches, [ $match, $callback, $plugin ];
-}
-
-sub add_command_watch {
-  my (undef, $match, $callback) = @_;
-  my ($plugin) = caller =~ m{::([^:]+)$};
-  $plugin //= caller;
-  push @command_watches, [ $match, $callback, $plugin ];
 }
 
 }
@@ -525,25 +500,31 @@ sub process_slack_message {
   $text = $data->{text} unless defined $text;
 
   # XXX hardcoded, really?
-  my @unknown_responses = (
-    "Sorry, what's that?",
-    "Wat?",
-    "Hmm?",
-    "Nope.",
-    "I got nothing.",
-    "Yeah, nah.",
-    "I could try, but it's probably not going to work.",
-    "No, you do it.",
-    "I can't!",
-    "It's too hard!",
-    "But it's cold outside and I'm frightened!",
-  );
+  my @unknown_responses = (Bort->user_name($user) =~ /dav(?:e|id)/i)
+    ? "I'm sorry Dave, I'm afraid I can't do that"
+    : (
+      "Sorry, what's that?",
+      "Wat?",
+      "Hmm?",
+      "Nope.",
+      "I got nothing.",
+      "Yeah, nah.",
+      "I could try, but it's probably not going to work.",
+      "No, you do it.",
+      "I can't!",
+      "It's too hard!",
+      "But it's cold outside and I'm frightened!",
+    );
 
-  if ((defined $name && $name eq $my_user_name) || !exists $channel_names{$channel}) {
+  if ((defined $name && $name eq $my_user_name)
+       || !exists $channel_names{$channel}) {
     my $matches =
       Bort::Watch->run_direct_watches($ctx, $text) +
       Bort::Watch->run_command_watches($ctx, $text);
-    $ctx->reply(":thinking_face: $unknown_responses[int(rand(scalar @unknown_responses))]") unless $matches;
+
+    $ctx->reply(":thinking_face: "
+      . "$unknown_responses[int(rand(scalar @unknown_responses))]")
+      unless $matches;
   }
 
   Bort::Watch->run_channel_watches($ctx, $data->{text});
